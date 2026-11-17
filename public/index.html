@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cloud Run Scaling Tester</title>
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --line:#2a2e38; --txt:#e6e8ee; --mut:#8b92a3; --ok:#3ecf8e; --bad:#ff6b6b; --acc:#6ea8fe; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:14px/1.5 system-ui, sans-serif; padding:20px; }
+  h1 { font-size:20px; margin:0 0 16px; }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--mut); margin:0 0 10px; }
+  .grid { display:grid; gap:16px; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .row { display:flex; gap:10px; align-items:end; flex-wrap:wrap; }
+  label { display:flex; flex-direction:column; font-size:12px; color:var(--mut); gap:4px; }
+  input { background:#0f1115; border:1px solid var(--line); color:var(--txt); border-radius:6px; padding:8px; width:120px; }
+  button { background:var(--acc); color:#0b1020; border:0; border-radius:6px; padding:9px 16px; font-weight:600; cursor:pointer; }
+  button.stop { background:var(--bad); }
+  button:disabled { opacity:.5; cursor:default; }
+  .kpis { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:14px; }
+  .kpi { background:#0f1115; border:1px solid var(--line); border-radius:8px; padding:10px; }
+  .kpi b { display:block; font-size:22px; }
+  .kpi span { color:var(--mut); font-size:12px; }
+  .big { font-size:40px; font-weight:700; }
+  .mut { color:var(--mut); }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:6px 4px; border-bottom:1px solid var(--line); }
+  .bars { display:flex; align-items:flex-end; gap:3px; height:90px; margin-top:8px; }
+  .bar { flex:1; background:var(--acc); border-radius:2px 2px 0 0; min-height:2px; position:relative; }
+  .bar.zero { background:var(--line); }
+  .bars.rps .bar { background:var(--ok); }
+  .err { color:var(--bad); font-size:12px; margin-top:8px; word-break:break-word; }
+  .note { font-size:12px; color:var(--mut); margin-top:8px; }
+</style>
+</head>
+<body>
+<h1>Cloud Run Scaling Tester <span class="mut" id="svcname"></span></h1>
+
+<div class="grid">
+  <div class="card">
+    <h2>Generate traffic</h2>
+    <div class="row">
+      <label>Concurrent users<input id="conc" type="number" value="50" min="1" max="300"></label>
+      <label>Duration (sec)<input id="dur" type="number" value="120" min="5" max="600"></label>
+      <button id="start">Start</button>
+      <button id="stop" class="stop" disabled>Stop</button>
+    </div>
+    <div class="kpis">
+      <div class="kpi"><b id="k-sent">0</b><span>requests sent</span></div>
+      <div class="kpi"><b id="k-rps">0</b><span>req/sec (now)</span></div>
+      <div class="kpi"><b id="k-lat">0 ms</b><span>avg latency</span></div>
+      <div class="kpi"><b id="k-ok" class="ok">0</b><span>success</span></div>
+      <div class="kpi"><b id="k-err" class="bad">0</b><span>errors</span></div>
+      <div class="kpi"><b id="k-time">0s</b><span>elapsed</span></div>
+    </div>
+    <div class="mut" style="margin-top:10px">Status codes: <span id="codes">-</span></div>
+    <div class="bars rps" id="rpsbars"></div>
+    <div class="note">Bars: requests per second, last 60 s.</div>
+    <div class="err" id="loaderr"></div>
+  </div>
+
+  <div class="card">
+    <h2>Live Cloud Run instances</h2>
+    <div class="big" id="inst-now">-</div>
+    <div class="mut" id="inst-split">active / idle</div>
+    <div class="bars" id="instbars"></div>
+    <div class="note">Per-minute max over the last 30 min. Cloud Monitoring lags 1–3 minutes, so scaling shows up late.</div>
+    <div class="err" id="insterr"></div>
+  </div>
+
+  <div class="card">
+    <h2>Service scaling config (from Cloud Run API)</h2>
+    <table>
+      <tr><th>Min instances</th><td id="c-min">-</td></tr>
+      <tr><th>Max instances</th><td id="c-max">-</td></tr>
+      <tr><th>Concurrency per instance</th><td id="c-conc">-</td></tr>
+      <tr><th>Latest revision</th><td id="c-rev">-</td></tr>
+      <tr><th>Last updated</th><td id="c-upd">-</td></tr>
+    </table>
+    <div class="err" id="svcerr"></div>
+  </div>
+
+  <div class="card">
+    <h2>Cloud Scheduler jobs</h2>
+    <table id="jobs"><tr><td class="mut">loading…</td></tr></table>
+    <div class="err" id="scherr"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmt = s => s ? new Date(s).toLocaleString() : '-';
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+$('start').onclick = async () => {
+  $('loaderr').textContent = '';
+  try {
+    await api('/api/load/start', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ concurrency: +$('conc').value, durationSec: +$('dur').value }) });
+  } catch (e) { $('loaderr').textContent = e.message; }
+};
+$('stop').onclick = () => api('/api/load/stop', { method:'POST' });
+
+async function pollLoad() {
+  try {
+    const s = await api('/api/load');
+    const running = !!s.running;
+    $('start').disabled = running; $('stop').disabled = !running;
+    if (!s.idle) {
+      $('k-sent').textContent = s.sent;
+      $('k-ok').textContent = s.ok;
+      $('k-err').textContent = s.errors;
+      $('k-lat').textContent = s.avgLatencyMs + ' ms';
+      $('k-time').textContent = s.elapsedSec + 's' + (running ? '' : ' (done)');
+      const last = s.series[s.series.length - 1];
+      $('k-rps').textContent = last ? last.rps : 0;
+      $('codes').textContent = Object.entries(s.codes).map(([k,v]) => `${k}: ${v}`).join('  ') || '-';
+      const pts = s.series.slice(-60); const mx = Math.max(1, ...pts.map(p => p.rps));
+      $('rpsbars').innerHTML = pts.map(p => `<div class="bar" style="height:${Math.max(2, p.rps / mx * 100)}%" title="${p.rps} rps"></div>`).join('');
+    }
+  } catch (e) { $('loaderr').textContent = e.message; }
+}
+
+async function pollCloud() {
+  try {
+    const c = await api('/api/cloud');
+    if (c.service) {
+      $('c-min').textContent = c.service.minInstances;
+      $('c-max').textContent = c.service.maxInstances ?? 'default';
+      $('c-conc').textContent = c.service.concurrency ?? 'default (80)';
+      $('c-rev').textContent = c.service.latestRevision || '-';
+      $('c-upd').textContent = fmt(c.service.updateTime);
+    }
+    $('svcerr').textContent = c.errors.service || '';
+    if (c.instances) {
+      const rows = c.instances;
+      const last = rows[rows.length - 1];
+      $('inst-now').textContent = last ? last.total : 0;
+      $('inst-split').textContent = last ? `${last.active || 0} active / ${last.idle || 0} idle (as of ${new Date(last.t).toLocaleTimeString()})` : 'no data (0 instances or no traffic yet)';
+      const mx = Math.max(2, ...rows.map(r => r.total));
+      $('instbars').innerHTML = rows.map(r => `<div class="bar ${r.total ? '' : 'zero'}" style="height:${Math.max(3, r.total / mx * 100)}%" title="${new Date(r.t).toLocaleTimeString()}: ${r.total}"></div>`).join('');
+    }
+    $('insterr').textContent = c.errors.instances || '';
+    if (c.scheduler) {
+      $('jobs').innerHTML = '<tr><th>Job</th><th>Schedule</th><th>Last run</th><th>Next run</th><th>Status</th></tr>' +
+        c.scheduler.map(j => `<tr><td>${j.name}</td><td>${j.schedule}<br><span class="mut">${j.timeZone}</span></td><td>${fmt(j.lastAttemptTime)}</td><td>${fmt(j.nextRun)}</td><td class="${j.lastStatus==='OK'?'ok':'bad'}">${j.lastStatus}</td></tr>`).join('');
+    }
+    $('scherr').textContent = c.errors.scheduler || '';
+  } catch (e) { $('svcerr').textContent = e.message; }
+}
+
+setInterval(pollLoad, 1000);
+setInterval(pollCloud, 10000);
+pollLoad(); pollCloud();
+</script>
+</body>
+</html>
